@@ -1,0 +1,13 @@
+# Install all providers:
+#   pip install -r requirements.txt
+#
+# Or install only what you need:
+#   pip install anthropic          # Claude
+#   pip install openai             # OpenAI, Groq, Ollama, MLX, custom endpoints
+#   pip install google-genai       # Gemini (native SDK)
+#   pip install python-dotenv      # .env file support (always recommended)
+
+anthropic>=0.40.0
+openai>=1.30.0
+google-genai>=1.0.0
+python-dotenv>=1.0.0
