@@ -1,6 +1,6 @@
 # prompt-forge
 
-Transform raw, sloppy prompts into production-quality prompts using any LLM. Rewrites your prompt with a system role, structured output format, XML delimiters, and few-shot example placeholders — instantly.
+Transform raw, sloppy prompts into production-quality prompts using any LLM. Rewrites your prompt with a system role, structured output format, XML delimiters, and concrete few-shot examples — instantly.
 
 ## Features
 
@@ -99,7 +99,7 @@ python prompt_forge.py --list-providers
 
 ## Prompt Versioning
 
-Saved versions are stored in `prompt_versions.json` in the project directory.
+Saved versions are stored in `prompt_versions.json` in the project directory (gitignored — local only).
 
 ```bash
 # Save a version
