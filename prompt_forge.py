@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import os
+import re
 import json
 import argparse
 import datetime
@@ -88,23 +89,76 @@ VERSIONS_FILE = Path(__file__).parent / "prompt_versions.json"
 
 # ── Meta-prompt ───────────────────────────────────────────────────────────────
 
-META_PROMPT_TEMPLATE = """You are a prompt engineering expert. Your task is to transform a raw, sloppy user prompt into a production-quality prompt.
+META_PROMPT_TEMPLATE = """You are a prompt engineering expert. Transform the raw prompt below into a production-quality prompt.
 
-The rewritten prompt MUST include all of the following elements:
+Here is a concrete example of what this transformation looks like:
 
-1. **System Role**: A clear `<system>` block defining the AI's role, expertise, and behavior.
-2. **Structured Output Format**: An `<output_format>` block specifying exactly how the response should be structured (e.g., JSON, markdown sections, numbered steps).
-3. **XML Delimiters**: Use XML tags to clearly delimit different data sections (e.g., `<context>`, `<input>`, `<instructions>`, `<constraints>`).
-4. **Few-Shot Example Placeholders**: Include an `<examples>` block with 2-3 placeholder examples in the format:
-   ```
-   <examples>
-   <example>
-     <input>{{EXAMPLE_INPUT_1}}</input>
-     <output>{{EXAMPLE_OUTPUT_1}}</output>
-   </example>
-   <!-- Add more examples as needed -->
-   </examples>
-   ```
+<transformation_example>
+<raw>analyze this dataset and find problems</raw>
+<rewritten>
+<system>
+You are a senior data quality analyst with expertise in statistical analysis, data profiling, and root-cause investigation. You produce precise, actionable audit reports.
+</system>
+
+<output_format>
+Respond with a structured markdown report:
+1. **Executive Summary** — 2–3 sentence overview of findings
+2. **Issues Found** — table with columns: Issue | Severity (Critical/High/Medium/Low) | Affected Column(s) | Recommended Fix
+3. **Suggested Next Steps** — numbered list of prioritized actions
+</output_format>
+
+<instructions>
+Analyze the provided dataset for: missing/null values, outliers, type mismatches, duplicates, and referential integrity violations.
+</instructions>
+
+<examples>
+<example>
+  <input>id,name,age,email\n1,Alice,29,alice@example.com\n2,,null,bob@\n3,Alice,29,alice@example.com</input>
+  <output>
+**Executive Summary**: The dataset (3 rows) has 2 quality issues: one incomplete record and one exact duplicate. Remediation required before downstream use.
+
+| Issue | Severity | Affected Column(s) | Recommended Fix |
+|---|---|---|---|
+| Missing name, invalid age | Critical | name, age | Backfill from source or flag for manual review |
+| Malformed email | High | email | Validate against RFC 5322 |
+| Exact duplicate row | Medium | all | Deduplicate on (name, age, email) |
+
+**Suggested Next Steps**:
+1. Deduplicate before any joins
+2. Add NOT NULL constraints on name and age
+3. Add email format validation at ingestion
+  </output>
+</example>
+<example>
+  <input>sales.csv with 10k rows — manager says revenue looks wrong</input>
+  <output>
+**Executive Summary**: Revenue column shows 340 negative values and a 6× spike on 2024-03-15 inconsistent with surrounding days. Likely a sign-reversal bug in ETL and a batch reprocessing artifact.
+
+| Issue | Severity | Affected Column(s) | Recommended Fix |
+|---|---|---|---|
+| Negative revenue values | Critical | revenue | Audit ETL sign convention; abs() as interim fix |
+| Anomalous spike 2024-03-15 | High | revenue, date | Investigate batch job logs for that date |
+
+**Suggested Next Steps**:
+1. Pull ETL logs for 2024-03-15
+2. Compare raw source vs loaded values for negative rows
+3. Add a revenue > 0 assertion to the pipeline
+  </output>
+</example>
+</examples>
+
+<context>
+{{DATASET_OR_SCHEMA}}
+</context>
+</rewritten>
+</transformation_example>
+
+Your rewritten prompt MUST include all of the following:
+
+1. **System Role**: A `<system>` block defining the AI's role, expertise, and behavior.
+2. **Structured Output Format**: An `<output_format>` block specifying exactly how the response should be structured.
+3. **XML Delimiters**: Use XML tags to delimit sections (`<context>`, `<input>`, `<instructions>`, `<constraints>` as appropriate).
+4. **Few-Shot Examples**: An `<examples>` block with 2–3 concrete, realistic examples drawn from the domain — not placeholder variables like {{EXAMPLE_INPUT_1}}. Infer plausible inputs and outputs from the raw prompt's intent.
 {domain_instruction}
 
 Raw prompt to transform:
@@ -112,7 +166,7 @@ Raw prompt to transform:
 {raw_prompt}
 </raw_prompt>
 
-Return ONLY the rewritten production-quality prompt. Do not include any explanation or commentary — just the improved prompt itself."""
+Return ONLY the rewritten production-quality prompt. Do not include any explanation or commentary."""
 
 
 def build_meta_prompt(raw_prompt: str, domain: str | None = None) -> str:
@@ -265,17 +319,23 @@ def rewrite_prompt(
 
     print("⟳ Rewriting prompt...\n", file=sys.stderr)
     parts: list[str] = []
-    for chunk in stream_completion(
-        system=system,
-        user=meta,
-        provider_cfg=provider_cfg,
-        model=model,
-        max_tokens=4096,
-        api_key=api_key,
-        base_url=base_url,
-    ):
-        print(chunk, end="", flush=True)
-        parts.append(chunk)
+    try:
+        for chunk in stream_completion(
+            system=system,
+            user=meta,
+            provider_cfg=provider_cfg,
+            model=model,
+            max_tokens=4096,
+            api_key=api_key,
+            base_url=base_url,
+        ):
+            print(chunk, end="", flush=True)
+            parts.append(chunk)
+    except KeyboardInterrupt:
+        print("\n[interrupted]", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        _die(f"API error ({provider_cfg.get('sdk', 'unknown')}): {e}")
 
     print()  # newline after stream
     return "".join(parts)
@@ -292,35 +352,49 @@ def run_prompt(
     """Execute a prompt (raw or rewritten) against the selected provider."""
     user_message = sample_input or "Please demonstrate your capabilities with a brief example."
 
-    # Extract <system> block if present
+    # Extract <system> or <s> block if present
     system_content = "You are a helpful AI assistant."
-    user_content = prompt
-
-    if "<system>" in prompt and "</system>" in prompt:
-        s = prompt.index("<system>") + len("<system>")
-        e = prompt.index("</system>")
-        system_content = prompt[s:e].strip()
-        before = prompt[: prompt.index("<system>")].strip()
-        after = prompt[prompt.index("</system>") + len("</system>"):].strip()
+    system_match = re.search(r'<(system|s)>(.*?)</\1>', prompt, re.DOTALL | re.IGNORECASE)
+    if system_match:
+        system_content = system_match.group(2).strip()
+        before = prompt[:system_match.start()].strip()
+        after = prompt[system_match.end():].strip()
         user_content = "\n\n".join(filter(None, [before, after, user_message]))
     else:
         user_content = f"{prompt}\n\n{user_message}"
 
     parts: list[str] = []
-    for chunk in stream_completion(
-        system=system_content,
-        user=user_content,
-        provider_cfg=provider_cfg,
-        model=model,
-        max_tokens=2048,
-        api_key=api_key,
-        base_url=base_url,
-    ):
-        print(chunk, end="", flush=True)
-        parts.append(chunk)
+    try:
+        for chunk in stream_completion(
+            system=system_content,
+            user=user_content,
+            provider_cfg=provider_cfg,
+            model=model,
+            max_tokens=2048,
+            api_key=api_key,
+            base_url=base_url,
+        ):
+            print(chunk, end="", flush=True)
+            parts.append(chunk)
+    except KeyboardInterrupt:
+        print("\n[interrupted]", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        _die(f"API error ({provider_cfg.get('sdk', 'unknown')}): {e}")
 
     print()
     return "".join(parts)
+
+
+def _structural_score(text: str) -> dict:
+    return {
+        "chars": len(text),
+        "words": len(text.split()),
+        "headers": bool(re.search(r'^#{1,3} |\*\*[A-Z]', text, re.MULTILINE)),
+        "table": bool(re.search(r'\|.+\|\n\|[-| :]+\|', text)),
+        "numbered_list": bool(re.search(r'^\s*\d+[.)]\s', text, re.MULTILINE)),
+        "bullet_list": bool(re.search(r'^\s*[-*]\s', text, re.MULTILINE)),
+    }
 
 
 def compare_prompts(
@@ -341,10 +415,14 @@ def compare_prompts(
     print(f"\n{sep}\nREWRITTEN PROMPT OUTPUT\n{sep}")
     rewr = run_prompt(rewritten_prompt, sample_input=sample_input, **kwargs)
 
+    o, r = _structural_score(orig), _structural_score(rewr)
     print(f"\n{sep}\nCOMPARISON SUMMARY\n{sep}")
-    print(f"Original length : {len(orig):,} chars")
-    print(f"Rewritten length: {len(rewr):,} chars")
-    print(f"Length ratio    : {len(rewr) / max(len(orig), 1):.2f}x")
+    print(f"  {'Metric':<20}  {'Original':>10}  {'Rewritten':>10}")
+    print("  " + "─" * 44)
+    print(f"  {'Characters':<20}  {o['chars']:>10,}  {r['chars']:>10,}")
+    print(f"  {'Words':<20}  {o['words']:>10,}  {r['words']:>10,}")
+    for key, label in [("headers", "Headers"), ("table", "Table"), ("numbered_list", "Numbered list"), ("bullet_list", "Bullet list")]:
+        print(f"  {label:<20}  {'✓' if o[key] else '✗':>10}  {'✓' if r[key] else '✗':>10}")
 
 
 # ── Version management ────────────────────────────────────────────────────────
